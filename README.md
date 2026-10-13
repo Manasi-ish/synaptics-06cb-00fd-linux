@@ -86,7 +86,7 @@ login screens offer the finger, with password fallback.
 If you don't use the script: build the `06cb-00fd` branch of
 [synaTudor](https://github.com/Manasi-ish/synaTudor) with `meson setup build -DUNMOUNTFS=true
 && ninja -C build && sudo ninja -C build install`, then `udevadm control --reload &&
-udevadm trigger`. See the branch's `REVERSE_ENGINEERING_HANDBOOK.md` and `contrib/`.
+udevadm trigger`. See the branch's `STATUS_WORKING.md` and `contrib/`.
 
 ## Credits
 
