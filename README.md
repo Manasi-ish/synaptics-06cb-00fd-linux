@@ -24,7 +24,7 @@ Device at /net/reactivated/Fprint/Device/0
 
 ## What this adds
 
-synaTudor upstream supports `06cb:00be`. This branch extends it to `06cb:00fd`:
+synaTudor upstream supports `06cb:00be`. The patches in `patches/` extend it to `06cb:00fd`:
 
 - **IdeaPad driver package** — `download_driver.sh` uses the Lenovo *consumer* package
   (`xalc0l0fqu9mwjc0.exe`) which contains the `00fd` id (Synaptics DLLs **v139**).
@@ -56,7 +56,7 @@ sudo ./install.sh
 The script will:
 
 1. install build dependencies,
-2. clone synaTudor at the `06cb-00fd` branch,
+2. clone upstream synaTudor at a pinned commit and apply `patches/`,
 3. build (this downloads the Lenovo IdeaPad driver package to extract the DLLs),
 4. install the TOD module + host launcher + udev rule,
 5. install/enable the `tudor-warm.service` warm-up service,

@@ -1,0 +1,467 @@
+From 5cfd3b64984104bc291dc896d07680c4ff863d33 Mon Sep 17 00:00:00 2001
+From: Manasi-ish <manasi2003patra@gmail.com>
+Date: Tue, 13 Oct 2026 21:33:32 +0530
+Subject: [PATCH 1/3] relink: WDF interface-property store (idx 50-52) + USB
+ interface claim + GetModuleHandleW(NULL) fix + RegQueryInfoKey + build/size
+ fixes
+
+Generic relinker fixes that do not depend on a specific sensor:
+- WDF 50/51/52 WdfDevice*InterfaceProperty implemented (keyed property store); stub idx 33.
+  This is the wall that blocks the whole Synaptics Tudor family (see #20).
+- Claim USB interfaces up-front (fixes capture: usbfs did not claim interface 0).
+- GetModuleHandleW(NULL)/GetModuleHandleExW(FROM_ADDRESS) return current module.
+- USER32/power/WTS/registry import stubs the driver needs for its notification path.
+- Raise IPC record/message size caps for larger drivers.
+- Build: -Wno-* flags for modern GCC; udev->libudev pkgconfig + udevdir default.
+---
+ libfprint-tod/meson.build              |   4 +-
+ libtudor/src/winapi/module.c           | 135 +++++++++++++++++++++++-
+ libtudor/src/winapi/reg.c              |  38 ++++++-
+ libtudor/src/winapi/wdf/device.c       | 139 ++++++++++++++++++++++++-
+ libtudor/src/winapi/wdf/usb.c          |  10 ++
+ meson.build                            |   4 +-
+ tudor-host/inc/tudor/libfprint-proto.h |   4 +-
+ 7 files changed, 324 insertions(+), 10 deletions(-)
+
+diff --git a/libfprint-tod/meson.build b/libfprint-tod/meson.build
+index 9e68c30..13a3fe9 100644
+--- a/libfprint-tod/meson.build
++++ b/libfprint-tod/meson.build
+@@ -10,7 +10,7 @@ tudor_tod_src = [
+ ]
+ 
+ libfprint_tod_dep = dependency('libfprint-2-tod-1')
+-udev_dep = dependency('udev')
++udev_dep = dependency('libudev')
+ libusb_dep = dependency('libusb-1.0')
+ gusb_dep = dependency('gusb')
+ json_glib_dep = dependency('json-glib-1.0')
+@@ -25,5 +25,5 @@ tudor_tod = shared_module('tudor_tod',
+ )
+ 
+ install_data('60-tudor-libfprint-tod.rules',
+-    install_dir: udev_dep.get_variable(pkgconfig: 'udevdir'),
++    install_dir: udev_dep.get_variable(pkgconfig: 'udevdir', default_value: '/usr/lib/udev'),
+ )
+\ No newline at end of file
+diff --git a/libtudor/src/winapi/module.c b/libtudor/src/winapi/module.c
+index cb57daf..b2ffec2 100644
+--- a/libtudor/src/winapi/module.c
++++ b/libtudor/src/winapi/module.c
+@@ -15,6 +15,7 @@ static void module_destr(struct winmodule *module) {
+ }
+ 
+ struct winmodule *winmodule_find(const char *name) {
++    if(!name) return NULL;
+     cant_fail_ret(pthread_rwlock_rdlock(&modules_lock));
+ 
+     struct winmodule *module = NULL;
+@@ -87,12 +88,14 @@ __winfnc BOOL FreeLibrary(HANDLE handle) {
+ WINAPI(FreeLibrary)
+ 
+ __winfnc HANDLE GetModuleHandleA(const char *name) {
++    if(!name) return cur_module ? cur_module->handle : NULL;
+     struct winmodule *module = (struct winmodule*) winmodule_find(name);
+     return module ? module->handle : NULL;
+ }
+ WINAPI(GetModuleHandleA)
+ 
+ __winfnc HANDLE GetModuleHandleW(const char16_t *name) {
++    if(!name) return cur_module ? cur_module->handle : NULL;
+     char *cname = winstr_to_str(name);
+     struct winmodule *module = (struct winmodule*) winmodule_find(cname);
+     free(cname);
+@@ -103,8 +106,9 @@ WINAPI(GetModuleHandleW)
+ #define GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS 0x00000004
+ __winfnc BOOL GetModuleHandleExW(DWORD flags, const char16_t *name, HANDLE *out) {
+     if(flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) {
+-        log_warn("GetModuleHandleExW called with unsupported flag GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS! [addr=%p]", name);
+-        return FALSE;
++        log_warn("GetModuleHandleExW called with unsupported flag GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS! [addr=%p] (returning current module)", name);
++        if(out) *out = cur_module ? cur_module->handle : NULL;
++        return TRUE;
+     }
+ 
+     char *cname = winstr_to_str(name);
+@@ -183,4 +187,129 @@ __winfnc void *GetProcAddress(HANDLE handle, const char *name) {
+     if(!resolv) winerr_set();
+     return resolv;
+ }
+-WINAPI(GetProcAddress)
+\ No newline at end of file
++WINAPI(GetProcAddress)
++/* --- minimal USER32 stubs (a UMDF biometric driver shouldn't need GUI calls) --- */
++__winfnc unsigned short RegisterClassExW(const void *wnd_class) {
++    (void) wnd_class;
++    return 1; /* fake ATOM */
++}
++WINAPI(RegisterClassExW)
++
++__winfnc unsigned short RegisterClassW(const void *wnd_class) {
++    (void) wnd_class;
++    return 1;
++}
++WINAPI(RegisterClassW)
++
++__winfnc int UnregisterClassW(const char16_t *name, HANDLE hinst) {
++    (void) name; (void) hinst;
++    return 1;
++}
++WINAPI(UnregisterClassW)
++
++/* --- USER32 window/message-loop stubs (driver creates a hidden window for device
++ *     notifications; we fake it so the notification thread runs without a real GUI) --- */
++#include <stdint.h>
++
++__winfnc HANDLE CreateWindowExW(DWORD ex_style, const char16_t *cls, const char16_t *title,
++        DWORD style, int x, int y, int w, int h, HANDLE parent, HANDLE menu, HANDLE inst, void *param) {
++    (void)ex_style;(void)cls;(void)title;(void)style;(void)x;(void)y;(void)w;(void)h;
++    (void)parent;(void)menu;(void)inst;(void)param;
++    return (HANDLE)(uintptr_t)1;
++}
++WINAPI(CreateWindowExW)
++
++__winfnc int DestroyWindow(HANDLE hwnd) { (void)hwnd; return 1; }
++WINAPI(DestroyWindow)
++
++__winfnc long long DefWindowProcW(HANDLE hwnd, unsigned int msg, unsigned long long wp, long long lp) {
++    (void)hwnd;(void)msg;(void)wp;(void)lp; return 0;
++}
++WINAPI(DefWindowProcW)
++
++/* Return 0 (WM_QUIT) so any message pump we start exits cleanly instead of spinning. */
++__winfnc int GetMessageW(void *msg, HANDLE hwnd, unsigned int min, unsigned int max) {
++    (void)msg;(void)hwnd;(void)min;(void)max; return 0;
++}
++WINAPI(GetMessageW)
++
++__winfnc int PeekMessageW(void *msg, HANDLE hwnd, unsigned int min, unsigned int max, unsigned int remove) {
++    (void)msg;(void)hwnd;(void)min;(void)max;(void)remove; return 0;
++}
++WINAPI(PeekMessageW)
++
++__winfnc int TranslateMessage(const void *msg) { (void)msg; return 0; }
++WINAPI(TranslateMessage)
++
++__winfnc long long DispatchMessageW(const void *msg) { (void)msg; return 0; }
++WINAPI(DispatchMessageW)
++
++__winfnc void PostQuitMessage(int code) { (void)code; }
++WINAPI(PostQuitMessage)
++
++__winfnc HANDLE RegisterDeviceNotificationW(HANDLE recipient, void *filter, DWORD flags) {
++    (void)recipient;(void)filter;(void)flags; return (HANDLE)(uintptr_t)1;
++}
++WINAPI(RegisterDeviceNotificationW)
++
++__winfnc int UnregisterDeviceNotification(HANDLE h) { (void)h; return 1; }
++WINAPI(UnregisterDeviceNotification)
++
++/* --- power / session notification stubs (USER32 + powrprof) --- */
++#include <stdint.h>
++
++__winfnc HANDLE RegisterPowerSettingNotification(HANDLE recipient, const void *guid, DWORD flags) {
++    (void)recipient; (void)guid; (void)flags;
++    return (HANDLE)(uintptr_t)1;
++}
++WINAPI(RegisterPowerSettingNotification)
++
++__winfnc int UnregisterPowerSettingNotification(HANDLE h) { (void)h; return 1; }
++WINAPI(UnregisterPowerSettingNotification)
++
++__winfnc HANDLE RegisterSuspendResumeNotification(HANDLE recipient, DWORD flags) {
++    (void)recipient; (void)flags;
++    return (HANDLE)(uintptr_t)1;
++}
++WINAPI(RegisterSuspendResumeNotification)
++
++__winfnc int UnregisterSuspendResumeNotification(HANDLE h) { (void)h; return 1; }
++WINAPI(UnregisterSuspendResumeNotification)
++
++__winfnc DWORD PowerSettingRegisterNotification(const void *guid, DWORD flags, HANDLE recipient, HANDLE *out) {
++    (void)guid; (void)flags; (void)recipient;
++    if(out) *out = (HANDLE)(uintptr_t)1;
++    return 0; /* ERROR_SUCCESS */
++}
++WINAPI(PowerSettingRegisterNotification)
++
++__winfnc DWORD PowerSettingUnregisterNotification(HANDLE h) { (void)h; return 0; }
++WINAPI(PowerSettingUnregisterNotification)
++
++/* --- WTSAPI32 session-notification stubs --- */
++#include <stdint.h>
++
++__winfnc int WTSRegisterSessionNotification(HANDLE hwnd, DWORD flags) { (void)hwnd; (void)flags; return 1; }
++WINAPI(WTSRegisterSessionNotification)
++
++__winfnc int WTSUnRegisterSessionNotification(HANDLE hwnd) { (void)hwnd; return 1; }
++WINAPI(WTSUnRegisterSessionNotification)
++
++__winfnc int WTSQuerySessionInformationW(HANDLE server, DWORD session, int info_class, char16_t **buf, DWORD *bytes) {
++    (void)server; (void)session; (void)info_class;
++    if(buf) *buf = NULL;
++    if(bytes) *bytes = 0;
++    return 0;
++}
++WINAPI(WTSQuerySessionInformationW)
++
++__winfnc int WTSQuerySessionInformationA(HANDLE server, DWORD session, int info_class, char **buf, DWORD *bytes) {
++    (void)server; (void)session; (void)info_class;
++    if(buf) *buf = NULL;
++    if(bytes) *bytes = 0;
++    return 0;
++}
++WINAPI(WTSQuerySessionInformationA)
++
++__winfnc void WTSFreeMemory(void *p) { (void)p; }
++WINAPI(WTSFreeMemory)
+diff --git a/libtudor/src/winapi/reg.c b/libtudor/src/winapi/reg.c
+index 427882e..c2045d4 100644
+--- a/libtudor/src/winapi/reg.c
++++ b/libtudor/src/winapi/reg.c
+@@ -190,4 +190,40 @@ __winfnc LONG RegSetValueExW(HANDLE hkey, const char16_t *val_name, DWORD resv,
+     free(val_cname);
+     return suc ? ERROR_SUCCESS : WINERR_SET_CODE;
+ }
+-WINAPI(RegSetValueExW)
+\ No newline at end of file
++WINAPI(RegSetValueExW)
++/* --- RegQueryInfoKey (A/W): report an empty key (fresh data store) --- */
++#include <stdint.h>
++
++__winfnc long RegQueryInfoKeyW(HANDLE hkey, char16_t *cls, DWORD *cls_len, DWORD *reserved,
++        DWORD *subkeys, DWORD *max_subkey_len, DWORD *max_class_len,
++        DWORD *values, DWORD *max_val_name_len, DWORD *max_val_len,
++        DWORD *sec_desc_len, void *last_write_time) {
++    (void)hkey; (void)cls; (void)reserved; (void)last_write_time;
++    if(cls_len) *cls_len = 0;
++    if(subkeys) *subkeys = 0;
++    if(max_subkey_len) *max_subkey_len = 0;
++    if(max_class_len) *max_class_len = 0;
++    if(values) *values = 0;
++    if(max_val_name_len) *max_val_name_len = 0;
++    if(max_val_len) *max_val_len = 0;
++    if(sec_desc_len) *sec_desc_len = 0;
++    return 0; /* ERROR_SUCCESS */
++}
++WINAPI(RegQueryInfoKeyW)
++
++__winfnc long RegQueryInfoKeyA(HANDLE hkey, char *cls, DWORD *cls_len, DWORD *reserved,
++        DWORD *subkeys, DWORD *max_subkey_len, DWORD *max_class_len,
++        DWORD *values, DWORD *max_val_name_len, DWORD *max_val_len,
++        DWORD *sec_desc_len, void *last_write_time) {
++    (void)hkey; (void)cls; (void)reserved; (void)last_write_time;
++    if(cls_len) *cls_len = 0;
++    if(subkeys) *subkeys = 0;
++    if(max_subkey_len) *max_subkey_len = 0;
++    if(max_class_len) *max_class_len = 0;
++    if(values) *values = 0;
++    if(max_val_name_len) *max_val_name_len = 0;
++    if(max_val_len) *max_val_len = 0;
++    if(sec_desc_len) *sec_desc_len = 0;
++    return 0;
++}
++WINAPI(RegQueryInfoKeyA)
+diff --git a/libtudor/src/winapi/wdf/device.c b/libtudor/src/winapi/wdf/device.c
+index ffd727a..6cba7c4 100644
+--- a/libtudor/src/winapi/wdf/device.c
++++ b/libtudor/src/winapi/wdf/device.c
+@@ -362,4 +362,141 @@ __winfnc NTSTATUS WdfDeviceRetrieveDeviceInterfaceString(WDF_DRIVER_GLOBALS *glo
+     wdf_set_string((struct wdf_string*) str, buf);
+     return STATUS_SUCCESS;
+ }
+-WDFFUNC(WdfDeviceRetrieveDeviceInterfaceString, 29)
+\ No newline at end of file
++WDFFUNC(WdfDeviceRetrieveDeviceInterfaceString, 29)
++/* =====================================================================
++ * Device interface property store -- WDF function table indices 33/50/51/52
++ *
++ * The Synaptics UMDF bio drivers (v111+/v139) attach per-interface data via
++ * WdfDeviceAssignInterfaceProperty(WDFFunctions[50]) and read it back with
++ * WdfDeviceAllocAndQueryInterfaceProperty(51) / WdfDeviceQueryInterfaceProperty(52).
++ * Previously these hit the abort stub ("Unresolved WDF function N called!").
++ *
++ * We keep a simple global linked-list store keyed by (interface GUID, DEVPROPKEY),
++ * exactly as suggested by the synaTudor maintainer in issue #20.
++ * ===================================================================== */
++#include <string.h>
++#include <stdlib.h>
++
++typedef struct _DEVPROPKEY {
++    GUID  fmtid;
++    ULONG pid;
++} DEVPROPKEY;
++
++typedef ULONG DEVPROPTYPE;
++
++typedef struct _WDF_DEVICE_INTERFACE_PROPERTY_DATA {
++    ULONG                 Size;
++    const GUID           *InterfaceClassGUID;
++    const UNICODE_STRING *ReferenceString;
++    const DEVPROPKEY     *PropertyKey;
++    ULONG                 Lcid;
++    ULONG                 Flags;
++} WDF_DEVICE_INTERFACE_PROPERTY_DATA;
++
++struct wdf_iface_prop {
++    struct wdf_iface_prop *next;
++    GUID        iface;
++    DEVPROPKEY  key;
++    DEVPROPTYPE type;
++    ULONG       len;
++    void       *data;
++};
++
++static struct wdf_iface_prop *g_iface_props;
++
++static struct wdf_iface_prop *iface_prop_find(const GUID *iface, const DEVPROPKEY *key) {
++    for (struct wdf_iface_prop *p = g_iface_props; p; p = p->next)
++        if (!memcmp(&p->iface, iface, sizeof(GUID)) && !memcmp(&p->key, key, sizeof(DEVPROPKEY)))
++            return p;
++    return NULL;
++}
++
++/* index 33: WdfDeviceSetPnpCapabilities -- safe no-op stub */
++__winfnc NTSTATUS WdfDeviceSetPnpCapabilities(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *caps) {
++    (void) globals; (void) device_obj; (void) caps;
++    return STATUS_SUCCESS;
++}
++WDFFUNC(WdfDeviceSetPnpCapabilities, 33)
++
++/* index 50: WdfDeviceAssignInterfaceProperty */
++__winfnc NTSTATUS WdfDeviceAssignInterfaceProperty(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj,
++        WDF_DEVICE_INTERFACE_PROPERTY_DATA *pd, DEVPROPTYPE type, ULONG len, void *buf) {
++    (void) globals; (void) device_obj;
++    if (!pd || !pd->InterfaceClassGUID || !pd->PropertyKey) return (NTSTATUS) 0xC000000D;
++    struct wdf_iface_prop *p = iface_prop_find(pd->InterfaceClassGUID, pd->PropertyKey);
++
++    if (!buf) { /* delete the property */
++        if (p) {
++            struct wdf_iface_prop **pp = &g_iface_props;
++            while (*pp && *pp != p) pp = &(*pp)->next;
++            if (*pp) *pp = p->next;
++            free(p->data);
++            free(p);
++        }
++        return STATUS_SUCCESS;
++    }
++
++    if (!p) {
++        p = calloc(1, sizeof(*p));
++        if (!p) return (NTSTATUS) 0xC000009A;
++        p->iface = *pd->InterfaceClassGUID;
++        p->key = *pd->PropertyKey;
++        p->next = g_iface_props;
++        g_iface_props = p;
++    }
++    free(p->data);
++    p->data = malloc(len ? len : 1);
++    if (!p->data) { p->len = 0; return (NTSTATUS) 0xC000009A; }
++    memcpy(p->data, buf, len);
++    p->len = len;
++    p->type = type;
++    return STATUS_SUCCESS;
++}
++WDFFUNC(WdfDeviceAssignInterfaceProperty, 50)
++
++static void iface_prop_mem_destr(struct wdf_memory *mem) {
++    wdf_cleanup_obj(&mem->object);
++    if (mem->owns_data) free(mem->data);
++    free(mem);
++}
++
++/* index 51: WdfDeviceAllocAndQueryInterfaceProperty */
++__winfnc NTSTATUS WdfDeviceAllocAndQueryInterfaceProperty(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj,
++        WDF_DEVICE_INTERFACE_PROPERTY_DATA *pd, ULONG pool, WDF_OBJECT_ATTRIBUTES *attrs,
++        WDFOBJECT *out_mem, DEVPROPTYPE *out_type) {
++    (void) device_obj; (void) pool;
++    struct wdf_iface_prop *p = (pd && pd->InterfaceClassGUID && pd->PropertyKey)
++        ? iface_prop_find(pd->InterfaceClassGUID, pd->PropertyKey) : NULL;
++    if (!p || !p->data) return (NTSTATUS) 0xC0000034; /* STATUS_OBJECT_NAME_NOT_FOUND */
++
++    struct wdf_memory *mem = malloc(sizeof(*mem));
++    if (!mem) return (NTSTATUS) 0xC000009A;
++    wdf_create_obj((struct wdf_object*) winwdf_get_driver(globals), &mem->object,
++                   (wdf_obj_destr_fnc*) iface_prop_mem_destr, attrs);
++    mem->data = malloc(p->len ? p->len : 1);
++    if (!mem->data) { free(mem); return (NTSTATUS) 0xC000009A; }
++    memcpy(mem->data, p->data, p->len);
++    mem->data_size = p->len;
++    mem->owns_data = true;
++
++    if (out_mem) *out_mem = &mem->object;
++    if (out_type) *out_type = p->type;
++    return STATUS_SUCCESS;
++}
++WDFFUNC(WdfDeviceAllocAndQueryInterfaceProperty, 51)
++
++/* index 52: WdfDeviceQueryInterfaceProperty */
++__winfnc NTSTATUS WdfDeviceQueryInterfaceProperty(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj,
++        WDF_DEVICE_INTERFACE_PROPERTY_DATA *pd, ULONG buf_len, void *buf,
++        ULONG *result_len, DEVPROPTYPE *out_type) {
++    (void) globals; (void) device_obj;
++    struct wdf_iface_prop *p = (pd && pd->InterfaceClassGUID && pd->PropertyKey)
++        ? iface_prop_find(pd->InterfaceClassGUID, pd->PropertyKey) : NULL;
++    if (!p) return (NTSTATUS) 0xC0000034;
++    if (result_len) *result_len = p->len;
++    if (out_type) *out_type = p->type;
++    if (buf_len < p->len) return STATUS_BUFFER_TOO_SMALL;
++    if (buf && p->len) memcpy(buf, p->data, p->len);
++    return STATUS_SUCCESS;
++}
++WDFFUNC(WdfDeviceQueryInterfaceProperty, 52)
+diff --git a/libtudor/src/winapi/wdf/usb.c b/libtudor/src/winapi/wdf/usb.c
+index 06836b3..be3cece 100644
+--- a/libtudor/src/winapi/wdf/usb.c
++++ b/libtudor/src/winapi/wdf/usb.c
+@@ -193,6 +193,16 @@ __winfnc NTSTATUS WdfUsbTargetDeviceCreate(WDF_DRIVER_GLOBALS *globals, WDFOBJEC
+         }
+     }
+ 
++    //Claim all interfaces up-front so USB transfers work regardless of whether
++    //the driver explicitly requests an interface object first.
++    //(fixes: kernel usbfs "did not claim interface 0 before use")
++    for(int i = 0; i < usb_dev->cfg_descr->bNumInterfaces; i++) {
++        int claim_err = libusb_claim_interface(usb_dev->libusb_dev, i);
++        if(claim_err != 0) {
++            log_error("libusb_claim_interface(%d) failed: %d [%s]", i, claim_err, libusb_error_name(claim_err));
++        }
++    }
++
+     wdf_set_usb_device(dev, usb_dev);
+     *out = &usb_dev->object;
+     return STATUS_SUCCESS;
+diff --git a/meson.build b/meson.build
+index 54d6dd9..8ade1ba 100644
+--- a/meson.build
++++ b/meson.build
+@@ -3,10 +3,12 @@ project('synaTudor', ['c'],
+     meson_version: '>= 0.57.0'
+ )
+ 
++add_global_arguments('-Wno-incompatible-pointer-types', '-Wno-int-conversion', '-Wno-implicit-function-declaration', '-Wno-return-mismatch', language : 'c')
++
+ INSTALL_DIR = '/sbin/tudor'
+ 
+ subdir('libtudor')
+ subdir('cli')
+ subdir('tudor-host')
+ subdir('tudor-host-launcher')
+-subdir('libfprint-tod')
+\ No newline at end of file
++subdir('libfprint-tod')
+diff --git a/tudor-host/inc/tudor/libfprint-proto.h b/tudor-host/inc/tudor/libfprint-proto.h
+index 2de02d3..eafee1e 100644
+--- a/tudor-host/inc/tudor/libfprint-proto.h
++++ b/tudor-host/inc/tudor/libfprint-proto.h
+@@ -36,8 +36,8 @@ enum ipc_msg_type {
+ #define IPC_SENSOR_NAME_SIZE 128
+ #define IPC_MAX_PDATA_SIZE 16384
+ 
+-#define IPC_MAX_RECORD_SIZE 98304
+-#define IPC_MAX_MESSAGE_SIZE 131072
++#define IPC_MAX_RECORD_SIZE 524288
++#define IPC_MAX_MESSAGE_SIZE 1048576
+ 
+ struct ipc_msg_init {
+     enum ipc_msg_type type;

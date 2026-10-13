@@ -3,18 +3,18 @@
 # install.sh - one-command install for the Synaptics 06cb:00fd fingerprint reader
 # on Linux (Ubuntu/Debian based).
 #
-# It builds synaTudor (the runtime relinker for Synaptics' Windows driver) from the
-# 06cb-00fd branch, installs the libfprint TOD module + host launcher + udev rule,
-# installs a boot-time warm-up service, and enables fingerprint auth for login /
-# lock screen / sudo.
+# It clones upstream synaTudor at a pinned commit, applies this repo's patches
+# (patches/0001* = generic relinker fixes, patches/0002* = 06cb:00fd support),
+# builds, installs the libfprint TOD module + host launcher + udev rule, installs
+# a boot-time warm-up service, and enables fingerprint auth for login / lock / sudo.
 #
 # Usage:   sudo ./install.sh
 #
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="${REPO:-https://github.com/Manasi-ish/synaTudor.git}"
-BRANCH="${BRANCH:-06cb-00fd}"
+REPO="${REPO:-https://github.com/Popax21/synaTudor.git}"
+BASE_COMMIT="${BASE_COMMIT:-31dfdb06107fd1c35c9f9ceae72617e98eccc43a}"
 SRC="${SRC:-/root/synaTudor-00fd}"
 
 [ "$(id -u)" -eq 0 ] || { echo "Please run as root:  sudo ./install.sh"; exit 1; }
@@ -27,14 +27,20 @@ apt-get install -y --no-install-recommends \
     libdbus-1-dev libsystemd-dev libudev-dev libjson-glib-dev libgusb-dev \
     libfprint-2-dev libfprint-2-tod-dev fprintd
 
-echo "==> Fetching synaTudor ($BRANCH)"
+echo "==> Fetching upstream synaTudor (pinned at $BASE_COMMIT)"
 if [ -d "$SRC/.git" ]; then
-    git -C "$SRC" fetch origin "$BRANCH"
-    git -C "$SRC" checkout "$BRANCH"
-    git -C "$SRC" pull --ff-only
+    git -C "$SRC" fetch origin
 else
-    git clone -b "$BRANCH" "$REPO" "$SRC"
+    git clone "$REPO" "$SRC"
 fi
+git -C "$SRC" checkout -f "$BASE_COMMIT"
+git -C "$SRC" clean -fdx
+
+echo "==> Applying this repo's patches"
+for p in "$HERE"/patches/*.patch; do
+    echo "    $(basename "$p")"
+    git -C "$SRC" apply --whitespace=nowarn "$p"
+done
 
 echo "==> Building (downloads the Lenovo IdeaPad driver package to extract the DLLs)"
 cd "$SRC"

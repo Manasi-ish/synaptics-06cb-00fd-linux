@@ -1,0 +1,134 @@
+From f4fe807aa3e3bdd9bf3e3c1b40a6de1d2b11f465 Mon Sep 17 00:00:00 2001
+From: Manasi-ish <manasi2003patra@gmail.com>
+Date: Tue, 13 Oct 2026 21:42:25 +0530
+Subject: [PATCH 2/3] Support Synaptics 06cb:00fd (Lenovo IdeaPad 3 14ITL6)
+
+Sensor-specific changes on top of the generic relinker fixes:
+- download_driver.sh: use the IdeaPad consumer driver package (xalc0l0fqu9mwjc0.exe),
+  which contains the 00fd id (Synaptics DLLs v139); verify via sha256sum.
+- installer.sha: hash for that package.
+- driver.c / meson.build: bump expected DLL names to v139
+  (synaFpAdapter139.dll, synaWudfBioUsb139.dll).
+- libfprint-tod: add 06cb:00fd to the id table and the udev rule.
+
+Depends on the generic fixes (WDF interface-property store, USB interface claim).
+Relates to #20.
+---
+ libfprint-tod/60-tudor-libfprint-tod.rules |  4 +++-
+ libfprint-tod/src/device.c                 |  1 +
+ libtudor/download_driver.sh                |  4 ++--
+ libtudor/installer.sha                     |  2 +-
+ libtudor/meson.build                       |  8 +++-----
+ libtudor/src/tudor/driver.c                | 16 ++++++++--------
+ 6 files changed, 18 insertions(+), 17 deletions(-)
+
+diff --git a/libfprint-tod/60-tudor-libfprint-tod.rules b/libfprint-tod/60-tudor-libfprint-tod.rules
+index 2ee7b8e..a45a0c8 100644
+--- a/libfprint-tod/60-tudor-libfprint-tod.rules
++++ b/libfprint-tod/60-tudor-libfprint-tod.rules
+@@ -1,2 +1,4 @@
+ SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00be", ATTRS{dev}=="*", TEST=="power/control", ATTR{power/control}="auto", MODE="0660", GROUP="plugdev"
+-SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00be", ENV{LIBFPRINT_DRIVER}="Tudor TOD"
+\ No newline at end of file
++SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00be", ENV{LIBFPRINT_DRIVER}="Tudor TOD"
++SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00fd", ATTRS{dev}=="*", TEST=="power/control", ATTR{power/control}="auto", MODE="0660", GROUP="plugdev"
++SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00fd", ENV{LIBFPRINT_DRIVER}="Tudor TOD"
+diff --git a/libfprint-tod/src/device.c b/libfprint-tod/src/device.c
+index fbe7010..f298b83 100644
+--- a/libfprint-tod/src/device.c
++++ b/libfprint-tod/src/device.c
+@@ -14,6 +14,7 @@ GType fpi_tod_shared_driver_get_type() {
+ 
+ static FpIdEntry tudor_ids[] = {
+     { .vid = 0x06cb, .pid = 0x00be },
++    { .vid = 0x06cb, .pid = 0x00fd },
+ //  { .vid = 0x06cb, .pid = 0x00bd }, //TODO Check if it's also supported
+     { 0 }
+ };
+diff --git a/libtudor/download_driver.sh b/libtudor/download_driver.sh
+index 4450786..3d6f288 100644
+--- a/libtudor/download_driver.sh
++++ b/libtudor/download_driver.sh
+@@ -9,8 +9,8 @@ mkdir -p "$TMP_DIR"
+ 
+ #Download the driver executable and check hash
+ INSTALLER="$TMP_DIR/installer.exe"
+-wget https://download.lenovo.com/pccbbs/mobiles/r19fp02w.exe -O "$INSTALLER"
+-shasum "$INSTALLER" | cut -d" " -f1 | cmp - "$HASH_FILE"
++wget https://download.lenovo.com/consumer/mobiles/xalc0l0fqu9mwjc0.exe -O "$INSTALLER"
++sha256sum "$INSTALLER" | cut -d" " -f1 | cmp - "$HASH_FILE"
+ 
+ #Extract the driver
+ WINDRV="$TMP_DIR/windrv"
+diff --git a/libtudor/installer.sha b/libtudor/installer.sha
+index 0fb4564..501688f 100644
+--- a/libtudor/installer.sha
++++ b/libtudor/installer.sha
+@@ -1 +1 @@
+-7450e2f94957723533e41a364538c2c788d92956
++d1f3d87dfbee744fa8cdd1d7085724899a2f72a25eaff897d772b3e13cd518d0
+diff --git a/libtudor/meson.build b/libtudor/meson.build
+index 37b076a..58246a6 100644
+--- a/libtudor/meson.build
++++ b/libtudor/meson.build
+@@ -65,12 +65,10 @@ libtudor_src = [
+ ]
+ 
+ driver_dll_names = [
+-    'synaFpAdapter104.dll',
+-    'synaWudfBioUsb104.dll'
++    'synaFpAdapter139.dll',
++    'synaWudfBioUsb139.dll'
+ ]
+ 
+-add_global_arguments('-Wno-incompatible-pointer-types', language : 'c')
+-
+ driver_dlls = custom_target('driver-download', 
+     output: driver_dll_names,
+     input: ['download_driver.sh', 'installer.sha'],
+@@ -110,4 +108,4 @@ libtudor = shared_library('tudor', [libtudor_src, driver_dll_blobs],
+ libtudor_dep = declare_dependency(
+     link_with: libtudor,
+     include_directories: libtudor_inc
+-)
++)
+\ No newline at end of file
+diff --git a/libtudor/src/tudor/driver.c b/libtudor/src/tudor/driver.c
+index 5b86fb1..031b5ff 100644
+--- a/libtudor/src/tudor/driver.c
++++ b/libtudor/src/tudor/driver.c
+@@ -1,26 +1,26 @@
+ #include "internal.h"
+ 
+-extern uint8_t _binary_libtudor_synaFpAdapter104_dll_start, _binary_libtudor_synaFpAdapter104_dll_end;
+-extern uint8_t _binary_libtudor_synaWudfBioUsb104_dll_start, _binary_libtudor_synaWudfBioUsb104_dll_end;
++extern uint8_t _binary_libtudor_synaFpAdapter139_dll_start, _binary_libtudor_synaFpAdapter139_dll_end;
++extern uint8_t _binary_libtudor_synaWudfBioUsb139_dll_start, _binary_libtudor_synaWudfBioUsb139_dll_end;
+ 
+ #define NUM_WINDRV_DLLS 2
+ struct windrv_dll tudor_windrv_dlls[] = {
+     {
+         .module = {
+-            .name = "synaFpAdapter104.dll",
+-            .cmdline = "synaFpAdapter104.dll",
++            .name = "synaFpAdapter139.dll",
++            .cmdline = "synaFpAdapter139.dll",
+             .environ = (const char*[]) { NULL }
+         },
+-        .pe_image = &_binary_libtudor_synaFpAdapter104_dll_start, .pe_image_end = &_binary_libtudor_synaFpAdapter104_dll_end,
++        .pe_image = &_binary_libtudor_synaFpAdapter139_dll_start, .pe_image_end = &_binary_libtudor_synaFpAdapter139_dll_end,
+         .is_adapter = true, .is_driver = false
+     },
+     {
+         .module = {
+-            .name = "synaWudfBioUsb104.dll",
+-            .cmdline = "synaWudfBioUsb104.dll",
++            .name = "synaWudfBioUsb139.dll",
++            .cmdline = "synaWudfBioUsb139.dll",
+             .environ = (const char*[]) { NULL }
+         },
+-        .pe_image = &_binary_libtudor_synaWudfBioUsb104_dll_start, .pe_image_end = &_binary_libtudor_synaWudfBioUsb104_dll_end,
++        .pe_image = &_binary_libtudor_synaWudfBioUsb139_dll_start, .pe_image_end = &_binary_libtudor_synaWudfBioUsb139_dll_end,
+         .is_adapter = false, .is_driver = true
+     }
+ };
